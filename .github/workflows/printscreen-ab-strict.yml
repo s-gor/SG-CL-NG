@@ -1,0 +1,178 @@
+name: Strict Print Screen A/B packages
+
+on:
+  push:
+    branches:
+      - feature/awg31
+    paths:
+      - .github/workflows/printscreen-ab-strict.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download exact tested artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path input/base, input/feature | Out-Null
+
+          gh run download 32842169375 `
+            --repo "${{ github.repository }}" `
+            --name sg-client-096-source-build `
+            --dir input/base
+
+          gh run download 32845599457 `
+            --repo "${{ github.repository }}" `
+            --name sg-client-096-source-build `
+            --dir input/feature
+
+          if (-not (Test-Path 'input/base/SG-Client.exe')) {
+            throw 'Exact tested baseline SG-Client.exe was not downloaded.'
+          }
+          if (-not (Test-Path 'input/feature/SG-Client.exe')) {
+            throw 'AWG31 feature SG-Client.exe was not downloaded.'
+          }
+
+      - name: Create package A - code only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = (Resolve-Path 'input/base').Path
+          $feature = (Resolve-Path 'input/feature').Path
+          $target = Join-Path $env:GITHUB_WORKSPACE 'packages/A-CODE-ONLY'
+
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item "$base\*" $target -Recurse -Force
+          Copy-Item "$feature\SG-Client.exe" "$target\SG-Client.exe" -Force
+
+          $baseFiles = Get-ChildItem $base -Recurse -File
+          $targetFiles = Get-ChildItem $target -Recurse -File
+          if ($baseFiles.Count -ne $targetFiles.Count) {
+            throw "Package A file-count mismatch: base=$($baseFiles.Count), A=$($targetFiles.Count)"
+          }
+
+          foreach ($file in $baseFiles) {
+            $relative = [IO.Path]::GetRelativePath($base, $file.FullName)
+            $candidate = Join-Path $target $relative
+            if (-not (Test-Path $candidate)) { throw "Package A missing: $relative" }
+
+            if ($relative -ieq 'SG-Client.exe') {
+              $expected = (Get-FileHash "$feature\SG-Client.exe" -Algorithm SHA256).Hash
+              $actual = (Get-FileHash $candidate -Algorithm SHA256).Hash
+              $old = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+              if ($actual -ne $expected) { throw 'Package A EXE does not match feature EXE.' }
+              if ($actual -eq $old) { throw 'Package A EXE unexpectedly matches baseline EXE.' }
+            }
+            else {
+              $expected = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+              $actual = (Get-FileHash $candidate -Algorithm SHA256).Hash
+              if ($actual -ne $expected) { throw "Package A changed non-EXE file: $relative" }
+            }
+          }
+
+      - name: Create package B - files only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = (Resolve-Path 'input/base').Path
+          $target = Join-Path $env:GITHUB_WORKSPACE 'packages/B-FILES-ONLY'
+          $runtime = Join-Path $target 'bin\awg31'
+
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Copy-Item "$base\*" $target -Recurse -Force
+
+          $url = 'https://github.com/amnezia-vpn/amneziawg-windows-client/releases/download/3.1.0/amneziawg-amd64-3.1.0.msi'
+          $expectedMsi = 'a1b48ea8699cd347832a3691d832004574ef8ad65bcf887611ac8acb99b7de8b'
+          $msi = Join-Path $env:RUNNER_TEMP 'amneziawg-amd64-3.1.0.msi'
+          $extract = Join-Path $env:RUNNER_TEMP 'awg31-extract'
+          $log = Join-Path $env:RUNNER_TEMP 'awg31-msiexec.log'
+
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          $actualMsi = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualMsi -ne $expectedMsi) {
+            throw "AWG31 MSI hash mismatch: $actualMsi"
+          }
+
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          $arguments = @('/a', $msi, '/qn', '/norestart', 'DO_NOT_LAUNCH=1', "TARGETDIR=$extract", '/L*v', $log)
+          $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) {
+            Get-Content $log -ErrorAction SilentlyContinue
+            throw "MSI extraction failed with code $($process.ExitCode)"
+          }
+
+          $gui = Get-ChildItem $extract -Recurse -File -Filter amneziawg.exe | Sort-Object Length -Descending | Select-Object -First 1
+          $cli = Get-ChildItem $extract -Recurse -File -Filter awg.exe | Sort-Object Length -Descending | Select-Object -First 1
+          $wintun = Get-ChildItem $extract -Recurse -File -Filter wintun.dll | Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $gui -or -not $cli -or -not $wintun) {
+            throw 'Required AWG31 runtime files were not found.'
+          }
+
+          New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+          Copy-Item $gui.FullName (Join-Path $runtime 'amneziawg.exe')
+          Copy-Item $cli.FullName (Join-Path $runtime 'awg.exe')
+          Copy-Item $wintun.FullName (Join-Path $runtime 'wintun.dll')
+
+          foreach ($file in Get-ChildItem $base -Recurse -File) {
+            $relative = [IO.Path]::GetRelativePath($base, $file.FullName)
+            $candidate = Join-Path $target $relative
+            if (-not (Test-Path $candidate)) { throw "Package B missing baseline file: $relative" }
+            $expected = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+            $actual = (Get-FileHash $candidate -Algorithm SHA256).Hash
+            if ($actual -ne $expected) { throw "Package B changed baseline file: $relative" }
+          }
+
+          $allowedExtras = @(
+            'bin\awg31\amneziawg.exe',
+            'bin\awg31\awg.exe',
+            'bin\awg31\wintun.dll'
+          )
+          $extras = Get-ChildItem $target -Recurse -File |
+            ForEach-Object { [IO.Path]::GetRelativePath($target, $_.FullName) } |
+            Where-Object { -not (Test-Path (Join-Path $base $_)) }
+          if (@($extras).Count -ne $allowedExtras.Count) {
+            throw "Package B extra-file count mismatch: $(@($extras).Count)"
+          }
+          foreach ($extra in $extras) {
+            if ($extra -notin $allowedExtras) { throw "Package B has unexpected extra file: $extra" }
+          }
+
+      - name: Zip and record hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path output | Out-Null
+
+          Compress-Archive -Path 'packages/A-CODE-ONLY/*' -DestinationPath 'output/PRINTSCREEN-A-CODE-ONLY.zip' -CompressionLevel Optimal
+          Compress-Archive -Path 'packages/B-FILES-ONLY/*' -DestinationPath 'output/PRINTSCREEN-B-FILES-ONLY.zip' -CompressionLevel Optimal
+
+          $a = (Get-FileHash 'output/PRINTSCREEN-A-CODE-ONLY.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $b = (Get-FileHash 'output/PRINTSCREEN-B-FILES-ONLY.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            "$a  PRINTSCREEN-A-CODE-ONLY.zip",
+            "$b  PRINTSCREEN-B-FILES-ONLY.zip"
+          ) | Set-Content -Encoding ascii 'output/SHA256.txt'
+
+          Write-Host "Package A SHA256: $a"
+          Write-Host "Package B SHA256: $b"
+
+      - name: Upload strict A/B packages
+        uses: actions/upload-artifact@v5
+        with:
+          name: printscreen-ab-strict
+          path: output
+          if-no-files-found: error
+          retention-days: 30
