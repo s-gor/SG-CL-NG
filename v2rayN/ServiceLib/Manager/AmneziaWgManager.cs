@@ -81,6 +81,8 @@ internal sealed class AwgParsedConfig
     public string Protocol { get; set; } = string.Empty;
     public string SuggestedName { get; set; } = string.Empty;
     public bool HasAmneziaParameters { get; set; }
+    public bool HasAwg3Parameters { get; set; }
+    public bool HasAwg31Parameters { get; set; }
 }
 
 internal sealed record AwgProcessResult(int ExitCode, string Output, string Error);
@@ -102,6 +104,7 @@ public sealed class AmneziaWgManager
     public string ConfigDirectory { get; }
     public string StorePath { get; }
     public string EngineDirectory { get; }
+    public string Awg31EngineDirectory { get; }
     public string RuntimeDirectory { get; }
     public string? ActiveProfileId { get; private set; }
 
@@ -122,6 +125,7 @@ public sealed class AmneziaWgManager
         ConfigDirectory = Path.Combine(StorageDirectory, "profiles");
         StorePath = Path.Combine(StorageDirectory, "profiles.json");
         EngineDirectory = Path.Combine(AppContext.BaseDirectory, "bin", "awg");
+        Awg31EngineDirectory = Path.Combine(AppContext.BaseDirectory, "bin", "awg31");
         RuntimeDirectory = Path.Combine(StorageDirectory, "runtime");
         Directory.CreateDirectory(ConfigDirectory);
         Directory.CreateDirectory(RuntimeDirectory);
@@ -181,11 +185,76 @@ public sealed class AmneziaWgManager
         }
     }
 
-    public bool HasCompleteEngine()
+    public bool HasCompleteEngine() => HasCompleteEngine(EngineDirectory);
+
+    public bool HasCompleteAwg31Engine() => HasCompleteEngine(Awg31EngineDirectory);
+
+    public static string GetRuntimeFolderName(string? content)
     {
-        return File.Exists(Path.Combine(EngineDirectory, "amneziawg.exe"))
-            && File.Exists(Path.Combine(EngineDirectory, "awg.exe"))
-            && File.Exists(Path.Combine(EngineDirectory, "wintun.dll"));
+        return HasAwg31RuntimeMarkers(content) ? "awg31" : "awg";
+    }
+
+    private static bool HasAwg31RuntimeMarkers(string? content)
+    {
+        if (content.IsNullOrEmpty())
+        {
+            return false;
+        }
+
+        var text = content!
+            .TrimStart('\uFEFF')
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Replace('\u00A0', ' ')
+            .Replace("\u200B", string.Empty)
+            .Replace("\u200C", string.Empty)
+            .Replace("\u200D", string.Empty)
+            .Replace("\u2060", string.Empty)
+            .Trim();
+
+        if (!text.Contains('\n') && text.Contains("\\n", StringComparison.Ordinal))
+        {
+            text = text.Replace("\\r\\n", "\n", StringComparison.Ordinal)
+                .Replace("\\n", "\n", StringComparison.Ordinal);
+        }
+
+        if (text.Contains('\n'))
+        {
+            foreach (var rawLine in text.Split('\n'))
+            {
+                var line = rawLine.Trim();
+                if (line.StartsWith('#') || line.StartsWith(';'))
+                {
+                    continue;
+                }
+                if (Regex.IsMatch(
+                        line,
+                        @"^(?:RandomTrailers|DisableCookies)\s*=",
+                        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        var interfaceIndex = text.IndexOf("[Interface]", StringComparison.OrdinalIgnoreCase);
+        var peerIndex = text.IndexOf("[Peer]", StringComparison.OrdinalIgnoreCase);
+        var interfaceText = interfaceIndex >= 0 && peerIndex > interfaceIndex
+            ? text[(interfaceIndex + "[Interface]".Length)..peerIndex]
+            : text;
+
+        return Regex.IsMatch(
+            interfaceText,
+            @"(?:^|\s)(?:RandomTrailers|DisableCookies)\s*=",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    private static bool HasCompleteEngine(string engineDirectory)
+    {
+        return File.Exists(Path.Combine(engineDirectory, "amneziawg.exe"))
+            && File.Exists(Path.Combine(engineDirectory, "awg.exe"))
+            && File.Exists(Path.Combine(engineDirectory, "wintun.dll"));
     }
 
     public static bool LooksLikeWireGuardConfig(string? content)
@@ -210,7 +279,7 @@ public sealed class AmneziaWgManager
         var normalized = NormalizeConfig(content!);
         return Regex.IsMatch(
             normalized,
-            @"(?im)^\s*(?:Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5])\s*=",
+            @"(?im)^\s*(?:Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)\s*=",
             RegexOptions.CultureInvariant);
     }
 
@@ -501,7 +570,6 @@ public sealed class AmneziaWgManager
 
     public async Task<AwgOperationResult> ConnectAsync(AwgProfile profile)
     {
-        EnsureEngine();
         if (!File.Exists(profile.ConfigPath))
         {
             throw new FileNotFoundException("Не найден файл профиля AmneziaWG.", profile.ConfigPath);
@@ -510,21 +578,25 @@ public sealed class AmneziaWgManager
         await _gate.WaitAsync();
         try
         {
-            Logging.SaveLog($"AmneziaWG connect begin: profile={profile.Name}; tunnel={profile.TunnelName}; endpoint={profile.Endpoint}; admin={Utils.IsAdministrator()}");
+            var sourceConfig = await File.ReadAllTextAsync(profile.ConfigPath);
+            var engineDirectory = GetEngineDirectoryForConfig(sourceConfig);
+            EnsureEngine(engineDirectory);
+
+            Logging.SaveLog($"AmneziaWG connect begin: profile={profile.Name}; protocol={profile.Protocol}; runtime={Path.GetFileName(engineDirectory)}; tunnel={profile.TunnelName}; endpoint={profile.Endpoint}; admin={Utils.IsAdministrator()}");
             await DisconnectAllCoreAsync();
-            var enginePath = Path.Combine(EngineDirectory, "amneziawg.exe");
-            var runtimeConfigPath = await BuildRuntimeConfigAsync(profile);
+            var enginePath = Path.Combine(engineDirectory, "amneziawg.exe");
+            var runtimeConfigPath = await BuildRuntimeConfigAsync(profile, sourceConfig);
             Logging.SaveLog($"AmneziaWG install service command: engine={enginePath}; config={runtimeConfigPath}; localNetwork={AppManager.Instance.Config.SgQuickSettingsItem.AllowLocalNetwork}; dnsThroughTun={AppManager.Instance.Config.SgQuickSettingsItem.DnsThroughTun}");
             var install = await RunProcessAsync(enginePath, ["/installtunnelservice", runtimeConfigPath], TimeSpan.FromSeconds(20));
-            Logging.SaveLog($"AmneziaWG install service result: exit={install.ExitCode}; output={install.Output.Trim()}; error={install.Error.Trim()}");
+            Logging.SaveLog($"AmneziaWG install service result: runtime={Path.GetFileName(engineDirectory)}; exit={install.ExitCode}; output={install.Output.Trim()}; error={install.Error.Trim()}");
             if (install.ExitCode != 0)
             {
                 throw new InvalidOperationException(GetProcessError(install, "не удалось установить туннельную службу AmneziaWG"));
             }
 
-            var status = await WaitForHandshakeAsync(profile, TimeSpan.FromSeconds(45));
+            var status = await WaitForHandshakeAsync(profile, engineDirectory, TimeSpan.FromSeconds(45));
             ActiveProfileId = profile.Id;
-            Logging.SaveLog($"AmneziaWG handshake confirmed: profile={profile.Name}; time={status.LastHandshake:O}");
+            Logging.SaveLog($"AmneziaWG handshake confirmed: profile={profile.Name}; runtime={Path.GetFileName(engineDirectory)}; time={status.LastHandshake:O}");
             Logging.SaveLog($"AmneziaWG connected: {profile.Name}; handshake={status.LastHandshake:O}");
             return status;
         }
@@ -554,10 +626,9 @@ public sealed class AmneziaWgManager
         "f800::/6", "fe00::/9", "fec0::/10", "ff00::/8"
     ];
 
-    private async Task<string> BuildRuntimeConfigAsync(AwgProfile profile)
+    private async Task<string> BuildRuntimeConfigAsync(AwgProfile profile, string source)
     {
         var settings = AppManager.Instance.Config.SgQuickSettingsItem ?? new SgQuickSettingsItem();
-        var source = await File.ReadAllTextAsync(profile.ConfigPath);
         var result = new List<string>();
         var dnsHostRoutes = settings.DnsThroughTun ? BuildDnsHostRoutes(profile.DNS) : [];
         var smartRouting = SgSmartRoutingHelper.Normalize(settings);
@@ -705,7 +776,7 @@ public sealed class AmneziaWgManager
 
     public async Task DisconnectAllAsync()
     {
-        if (!HasCompleteEngine())
+        if (!HasCompleteEngine() && !HasCompleteAwg31Engine())
         {
             ActiveProfileId = null;
             return;
@@ -732,15 +803,27 @@ public sealed class AmneziaWgManager
             return;
         }
 
-        var enginePath = Path.Combine(EngineDirectory, "amneziawg.exe");
         foreach (var tunnelName in tunnelNames)
         {
-            Logging.SaveLog($"AmneziaWG uninstall service command: {tunnelName}");
-            var result = await RunProcessAsync(enginePath, ["/uninstalltunnelservice", tunnelName], TimeSpan.FromSeconds(15));
-            Logging.SaveLog($"AmneziaWG uninstall service result: tunnel={tunnelName}; exit={result.ExitCode}; output={result.Output.Trim()}; error={result.Error.Trim()}");
-            if (result.ExitCode != 0 && ServiceExists(tunnelName))
+            AwgProcessResult? lastResult = null;
+            foreach (var engineDirectory in GetEngineDirectoriesForTunnel(tunnelName))
             {
-                throw new InvalidOperationException(GetProcessError(result, $"не удалось отключить туннель {tunnelName}"));
+                var enginePath = Path.Combine(engineDirectory, "amneziawg.exe");
+                Logging.SaveLog($"AmneziaWG uninstall service command: tunnel={tunnelName}; runtime={Path.GetFileName(engineDirectory)}");
+                lastResult = await RunProcessAsync(enginePath, ["/uninstalltunnelservice", tunnelName], TimeSpan.FromSeconds(15));
+                Logging.SaveLog($"AmneziaWG uninstall service result: tunnel={tunnelName}; runtime={Path.GetFileName(engineDirectory)}; exit={lastResult.ExitCode}; output={lastResult.Output.Trim()}; error={lastResult.Error.Trim()}");
+                if (!ServiceExists(tunnelName))
+                {
+                    break;
+                }
+            }
+
+            if (ServiceExists(tunnelName))
+            {
+                throw new InvalidOperationException(
+                    lastResult == null
+                        ? $"не найден runtime для отключения туннеля {tunnelName}"
+                        : GetProcessError(lastResult, $"не удалось отключить туннель {tunnelName}"));
             }
         }
 
@@ -759,6 +842,11 @@ public sealed class AmneziaWgManager
     }
 
     public async Task<AwgOperationResult> QueryStatusAsync(AwgProfile profile)
+    {
+        return await QueryStatusAsync(profile, GetEngineDirectoryForProfile(profile));
+    }
+
+    private async Task<AwgOperationResult> QueryStatusAsync(AwgProfile profile, string engineDirectory)
     {
         if (!ServiceExists(profile.TunnelName))
         {
@@ -797,7 +885,7 @@ public sealed class AmneziaWgManager
             case 1:
                 return new AwgOperationResult { Success = false, State = "error", Message = "Туннельная служба остановлена, но ещё не удалена", ServicePresent = true };
             case 4:
-                var handshake = await GetLatestHandshakeAsync(profile.TunnelName);
+                var handshake = await GetLatestHandshakeAsync(profile.TunnelName, engineDirectory);
                 if (handshake == null)
                 {
                     return new AwgOperationResult { Success = true, State = "connecting", Message = "Служба запущена; handshake ещё не получен", ServicePresent = true };
@@ -816,14 +904,17 @@ public sealed class AmneziaWgManager
         }
     }
 
-    private async Task<AwgOperationResult> WaitForHandshakeAsync(AwgProfile profile, TimeSpan timeout)
+    private async Task<AwgOperationResult> WaitForHandshakeAsync(
+        AwgProfile profile,
+        string engineDirectory,
+        TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
         var serviceSeen = false;
         AwgOperationResult? last = null;
         while (DateTime.UtcNow < deadline)
         {
-            last = await QueryStatusAsync(profile);
+            last = await QueryStatusAsync(profile, engineDirectory);
             serviceSeen |= last.ServicePresent;
             if (last.State == "connected" && last.LastHandshake != null)
             {
@@ -854,7 +945,7 @@ public sealed class AmneziaWgManager
             return null;
         }
 
-        var awgPath = Path.Combine(EngineDirectory, "awg.exe");
+        var awgPath = Path.Combine(GetEngineDirectoryForProfile(profile), "awg.exe");
         var result = await RunProcessAsync(
             awgPath,
             ["show", profile.TunnelName, "transfer"],
@@ -903,9 +994,9 @@ public sealed class AmneziaWgManager
             : null;
     }
 
-    private async Task<DateTime?> GetLatestHandshakeAsync(string tunnelName)
+    private async Task<DateTime?> GetLatestHandshakeAsync(string tunnelName, string engineDirectory)
     {
-        var awgPath = Path.Combine(EngineDirectory, "awg.exe");
+        var awgPath = Path.Combine(engineDirectory, "awg.exe");
         var result = await RunProcessAsync(awgPath, ["show", tunnelName, "latest-handshakes"], TimeSpan.FromSeconds(4));
         if (result.ExitCode != 0)
         {
@@ -1035,12 +1126,66 @@ public sealed class AmneziaWgManager
         return detail.IsNullOrEmpty() ? fallback : $"{fallback}: {detail}";
     }
 
-    private void EnsureEngine()
+    private void EnsureEngine(string engineDirectory)
     {
-        if (!HasCompleteEngine())
+        if (HasCompleteEngine(engineDirectory))
         {
-            throw new FileNotFoundException("Не найдены amneziawg.exe, awg.exe и wintun.dll в bin\\awg.");
+            return;
         }
+
+        var folderName = Path.GetFileName(engineDirectory);
+        throw new FileNotFoundException(
+            $"Не найдены amneziawg.exe, awg.exe и wintun.dll в bin\\{folderName}.");
+    }
+
+    private string GetEngineDirectoryForConfig(string? content)
+    {
+        return string.Equals(GetRuntimeFolderName(content), "awg31", StringComparison.OrdinalIgnoreCase)
+            ? Awg31EngineDirectory
+            : EngineDirectory;
+    }
+
+    private string GetEngineDirectoryForProfile(AwgProfile profile)
+    {
+        try
+        {
+            if (File.Exists(profile.ConfigPath))
+            {
+                return GetEngineDirectoryForConfig(File.ReadAllText(profile.ConfigPath));
+            }
+        }
+        catch (Exception ex)
+        {
+            Logging.SaveLog($"Read AmneziaWG profile runtime: {profile.Name}", ex);
+        }
+
+        return profile.Protocol.StartsWith("AmneziaWG 3.1", StringComparison.OrdinalIgnoreCase)
+            ? Awg31EngineDirectory
+            : EngineDirectory;
+    }
+
+    private IReadOnlyList<string> GetEngineDirectoriesForTunnel(string tunnelName)
+    {
+        var result = new List<string>();
+        var profile = _store.Profiles.FirstOrDefault(item =>
+            string.Equals(item.TunnelName, tunnelName, StringComparison.OrdinalIgnoreCase));
+        if (profile != null)
+        {
+            result.Add(GetEngineDirectoryForProfile(profile));
+        }
+
+        if (HasCompleteEngine())
+        {
+            result.Add(EngineDirectory);
+        }
+        if (HasCompleteAwg31Engine())
+        {
+            result.Add(Awg31EngineDirectory);
+        }
+
+        return result
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     private static AwgParsedConfig ParseConfig(string content)
@@ -1062,9 +1207,16 @@ public sealed class AmneziaWgManager
         var publicKey = string.Empty;
         var presharedKey = string.Empty;
         var mtuValue = string.Empty;
+        var headerProtectionKey = string.Empty;
+        var s1Value = string.Empty;
+        var s2Value = string.Empty;
+        var s3Value = string.Empty;
+        var s4Value = string.Empty;
         var metadataName = string.Empty;
         var metadataClient = string.Empty;
         var amneziaKeys = 0;
+        var awg3Keys = 0;
+        var awg31Keys = 0;
 
         foreach (var rawLine in normalized.Replace("\r\n", "\n").Split('\n'))
         {
@@ -1116,9 +1268,57 @@ public sealed class AmneziaWgManager
                     case "address": result.Address = FirstCsv(value); break;
                     case "dns": result.DNS = CleanCsv(value); break;
                     case "mtu": mtuValue = value; break;
-                    case "jc": case "jmin": case "jmax": case "s1": case "s2": case "s3": case "s4":
+                    case "jc": case "jmin": case "jmax":
                     case "h1": case "h2": case "h3": case "h4": case "i1": case "i2": case "i3": case "i4": case "i5":
                         if (value.IsNotEmpty()) amneziaKeys++;
+                        break;
+                    case "s1":
+                        s1Value = value;
+                        if (value.IsNotEmpty()) amneziaKeys++;
+                        break;
+                    case "s2":
+                        s2Value = value;
+                        if (value.IsNotEmpty()) amneziaKeys++;
+                        break;
+                    case "s3":
+                        s3Value = value;
+                        if (value.IsNotEmpty()) amneziaKeys++;
+                        break;
+                    case "s4":
+                        s4Value = value;
+                        if (value.IsNotEmpty()) amneziaKeys++;
+                        break;
+                    case "headerprotectionkey":
+                        headerProtectionKey = value;
+                        if (value.IsNotEmpty())
+                        {
+                            amneziaKeys++;
+                            awg3Keys++;
+                        }
+                        break;
+                    case "contentpaddingaddition":
+                    case "rekeyaftertime":
+                    case "rekeytimeout":
+                    case "rejectaftertime":
+                    case "keepalivetimeout":
+                    case "maxhandshakeattempts":
+                        if (value.IsNotEmpty())
+                        {
+                            amneziaKeys++;
+                            awg3Keys++;
+                        }
+                        break;
+                    case "randomtrailers":
+                        ValidateAwg31Switch(value, "RandomTrailers");
+                        amneziaKeys++;
+                        awg3Keys++;
+                        awg31Keys++;
+                        break;
+                    case "disablecookies":
+                        ValidateAwg31Switch(value, "DisableCookies");
+                        amneziaKeys++;
+                        awg3Keys++;
+                        awg31Keys++;
                         break;
                 }
             }
@@ -1154,6 +1354,7 @@ public sealed class AmneziaWgManager
         ValidateKey(publicKey, "PublicKey", required: true);
         ValidateKey(presharedKey, "PresharedKey", required: false);
         ValidateMtu(mtuValue);
+        ValidateAwg3HeaderProtection(headerProtectionKey, s1Value, s2Value, s3Value, s4Value);
 
         foreach (var allowed in result.AllowedIps.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
@@ -1161,7 +1362,15 @@ public sealed class AmneziaWgManager
         }
 
         result.HasAmneziaParameters = amneziaKeys > 0;
-        result.Protocol = result.HasAmneziaParameters ? "AmneziaWG 2.0" : "WireGuard";
+        result.HasAwg3Parameters = awg3Keys > 0;
+        result.HasAwg31Parameters = awg31Keys > 0;
+        result.Protocol = result.HasAwg31Parameters
+            ? "AmneziaWG 3.1"
+            : result.HasAwg3Parameters
+                ? "AmneziaWG 3.0"
+                : result.HasAmneziaParameters
+                    ? "AmneziaWG 2.0"
+                    : "WireGuard";
         result.SuggestedName = metadataName.IsNotEmpty() ? metadataName : metadataClient;
         return result;
     }
@@ -1244,7 +1453,7 @@ public sealed class AmneziaWgManager
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         text = Regex.Replace(
             text,
-            @"\s+(?=(?:Address|DNS|PrivateKey|MTU|Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5]|PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=)",
+            @"\s+(?=(?:Address|DNS|PrivateKey|MTU|Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies|PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=)",
             "\n",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         return text.Trim();
@@ -1342,6 +1551,44 @@ public sealed class AmneziaWgManager
         if (!int.TryParse(value, out var mtu) || mtu is < 576 or > 65535)
         {
             throw new InvalidDataException("MTU должен быть числом от 576 до 65535.");
+        }
+    }
+
+    private static void ValidateAwg3HeaderProtection(
+        string headerProtectionKey,
+        string s1Value,
+        string s2Value,
+        string s3Value,
+        string s4Value)
+    {
+        if (headerProtectionKey.IsNullOrEmpty())
+        {
+            return;
+        }
+
+        ValidateKey(headerProtectionKey, "HeaderProtectionKey", required: true);
+        ValidateAwg3Padding(s1Value, "S1");
+        ValidateAwg3Padding(s2Value, "S2");
+        ValidateAwg3Padding(s3Value, "S3");
+        ValidateAwg3Padding(s4Value, "S4");
+    }
+
+    private static void ValidateAwg3Padding(string value, string fieldName)
+    {
+        if (!int.TryParse(value, out var padding) || padding < 9)
+        {
+            throw new InvalidDataException($"AWG3 с HeaderProtectionKey требует {fieldName} больше 8.");
+        }
+    }
+
+    private static void ValidateAwg31Switch(string value, string fieldName)
+    {
+        if (!value.Equals("on", StringComparison.OrdinalIgnoreCase)
+            && !value.Equals("off", StringComparison.OrdinalIgnoreCase)
+            && value != "0"
+            && value != "1")
+        {
+            throw new InvalidDataException($"{fieldName} должен иметь значение on, off, 0 или 1.");
         }
     }
 
