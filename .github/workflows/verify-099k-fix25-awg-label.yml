@@ -1,0 +1,38 @@
+name: Verify 099K FIX25 AWG device label
+
+on:
+  push:
+    branches:
+      - scratch/verify-099k-fix25-awg-label
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout verification tree
+        uses: actions/checkout@v4
+
+      - name: Verify exact parser source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "835bb3598077888abb5854e776cdf4392b7731f4498553f893680cbc834cbd05  scratch/fix25/SgSubscriptionParser.cs" | sha256sum -c -
+          grep -F 'var deviceLabel = primary ? string.Empty : deviceName;' scratch/fix25/SgSubscriptionParser.cs
+          if grep -F '? "Основное устройство"' scratch/fix25/SgSubscriptionParser.cs; then
+            exit 1
+          fi
+          if grep -F 'deviceName.IsNotEmpty() ? deviceName : "Устройство"' scratch/fix25/SgSubscriptionParser.cs; then
+            exit 1
+          fi
+
+      - name: Set up .NET SDK 10.0.302
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.302
+
+      - name: Compile and execute exact parser
+        run: dotnet run --project scratch/fix25/Fix25Harness.csproj -c Release
